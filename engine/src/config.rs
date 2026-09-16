@@ -17,7 +17,7 @@ pub fn cost_per_event_usd(
     sstore_cost + blob_cost
 }
 
-/// Default cost at Arbitrum One with w=512 epoch size.
+/// Analytical cost with placeholder Arbitrum-like parameters (w=512).
 pub fn default_cost_arb() -> f64 {
     cost_per_event_usd(512, 200.0, 4.0, 0.10, 0.10, 2_000.0)
 }
@@ -106,8 +106,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cost_arb_matches_table8() {
-        // Table 8: EVM-Lineage on Arbitrum ≈ $0.000011/event
+    fn cost_model_positive_and_small_on_l2() {
+        // Consistency check of the analytical model only; the paper's
+        // cost table must be regenerated from measured chain parameters.
         let c = default_cost_arb();
         assert!(c < 0.0001 && c > 0.0, "cost ${c:.8}");
     }

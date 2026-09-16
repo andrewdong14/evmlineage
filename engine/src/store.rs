@@ -9,7 +9,7 @@
 // The interface is identical to the RocksDB-backed version.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use serde::{Serialize, Deserialize};
 
 use crate::sha256;
@@ -36,7 +36,7 @@ impl Default for VertexType { fn default() -> Self { VertexType::Other } }
 /// Max inline content size (bytes); larger items are referenced by hash.
 pub const MAX_INLINE: usize = 256;
 
-// ── Vertex record (~312 bytes median) ────────────────────────────────────────
+// ── Vertex record ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vertex {
@@ -153,6 +153,15 @@ impl LineageStore {
     }
     pub fn get_epsl_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.inner.lock().unwrap().epsl_raw.get(key).cloned()
+    }
+
+    /// Delete a vertex and its outgoing edges (Phase-5 GC of
+    /// branch-exclusive vertices; shared vertices are never removed).
+    pub fn remove_vertex(&self, h: &VertexHash) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if g.vertices.remove(h).is_none() { return false; }
+        g.edges.retain(|k, _| &k.src != h);
+        true
     }
 
     pub fn vertex_count(&self)  -> usize { self.inner.lock().unwrap().vertices.len() }

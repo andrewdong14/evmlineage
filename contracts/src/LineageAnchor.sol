@@ -6,10 +6,17 @@ pragma solidity ^0.8.24;
 ///         Compiled with solc 0.8.24, optimiser runs=200.
 ///
 /// Operations:
-///   commitRoot   – anchor batch Merkle root + EIP-4844 KZG blob hash
-///   verifyProof  – Merkle inclusion proof, ~430 gas/hash (assembly optimised)
-///   slash        – fraud proof → slash committer stake
+///   commitRoot   – anchor the epoch's EPSL state root + EIP-4844 blob hash
+///   verifyProof  – Merkle inclusion proof (assembly inner loop)
+///   slash        – equivocation fraud proof → slash the epoch committer
 ///   epochRoot    – read committed root for a given epoch
+///
+/// Leaf convention (identical in the Rust engine and Python layer):
+///   leaf = keccak256(abi.encodePacked(vertexHash, recordDigest))
+/// where recordDigest commits the vertex's adjacency as of the epoch.
+/// A root is fraudulent iff it contains two different records for the
+/// same vertexHash — exactly what slash() checks. Two arbitrary distinct
+/// leaves are NOT fraud (every honest tree has many).
 
 error NotCommitter();
 error EpochAlreadyCommitted(uint64 epoch);
@@ -19,6 +26,8 @@ error InvalidBlobHash();
 error InsufficientStake();
 error AlreadySlashed();
 error InvalidFraudProof();
+error SelfEquivocationRequired();
+error UnknownCommitter(uint64 epoch);
 error ZeroAddress();
 error NotInitialised();
 error AlreadyInitialised();
@@ -38,6 +47,7 @@ struct LS {
     mapping(uint64  => uint256) epochBlocks;
     mapping(address => uint256) stakes;
     mapping(address => bool)    slashed;
+    mapping(uint64  => address) epochCommitter;
     uint64  latestEpoch;
     uint64  totalEpochs;
     uint256 minStake;
@@ -99,6 +109,7 @@ contract LineageAnchor {
         s.epochRoots[epoch]      = root;
         s.epochBlobHashes[epoch] = blobHash;
         s.epochBlocks[epoch]     = block.number;
+        s.epochCommitter[epoch]  = msg.sender;
         s.latestEpoch            = epoch;
         s.totalEpochs           += 1;
         emit RootCommitted(epoch, root, blobHash, msg.sender, block.number);
@@ -134,20 +145,31 @@ contract LineageAnchor {
         emit ProofVerified(epoch, leaf, msg.sender);
     }
 
-    /// @notice Fraud proof: two distinct leaves both valid against same epoch root.
-    function slash(address committer,
-                   bytes32 leafA, bytes32[] calldata proofA,
-                   bytes32 leafB, bytes32[] calldata proofB,
+    /// @notice Equivocation fraud proof. A committed root is fraudulent
+    ///         iff it binds the SAME vertex hash to TWO different node
+    ///         records. The caller supplies both record digests with
+    ///         inclusion proofs; leaves are recomputed on-chain as
+    ///         keccak256(vertexHash || digest), so arbitrary distinct
+    ///         leaves cannot be used to slash an honest committer.
+    ///         The stake of the epoch's recorded committer is slashed
+    ///         and paid to the challenger.
+    function slash(bytes32 vertexHash,
+                   bytes32 digestA, bytes32[] calldata proofA,
+                   bytes32 digestB, bytes32[] calldata proofB,
                    uint64  epoch) external
     {
         LS storage s = _s();
-        if (s.slashed[committer]) revert AlreadySlashed();
-        require(leafA != leafB, "leaves must differ");
+        address committer = s.epochCommitter[epoch];
+        if (committer == address(0)) revert UnknownCommitter(epoch);
+        if (s.slashed[committer])    revert AlreadySlashed();
+        if (digestA == digestB)      revert SelfEquivocationRequired();
+        bytes32 leafA = keccak256(abi.encodePacked(vertexHash, digestA));
+        bytes32 leafB = keccak256(abi.encodePacked(vertexHash, digestB));
         if (!this.verifyProof(leafA, proofA, epoch)) revert InvalidFraudProof();
         if (!this.verifyProof(leafB, proofB, epoch)) revert InvalidFraudProof();
         uint256 stake = s.stakes[committer];
-        s.slashed[committer]  = true;
-        s.stakes[committer]   = 0;
+        s.slashed[committer] = true;
+        s.stakes[committer]  = 0;
         (bool ok,) = msg.sender.call{value: stake}("");
         require(ok, "transfer failed");
         emit CommitterSlashed(committer, stake);
@@ -155,6 +177,7 @@ contract LineageAnchor {
 
     // View helpers
     function epochRoot(uint64 e)      external view returns (bytes32) { return _s().epochRoots[e]; }
+    function epochCommitter(uint64 e) external view returns (address) { return _s().epochCommitter[e]; }
     function epochBlobHash(uint64 e)  external view returns (bytes32) { return _s().epochBlobHashes[e]; }
     function epochBlock(uint64 e)     external view returns (uint256) { return _s().epochBlocks[e]; }
     function latestEpoch()            external view returns (uint64)  { return _s().latestEpoch; }

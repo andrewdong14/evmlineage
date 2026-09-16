@@ -71,6 +71,7 @@ sys.path.insert(0, str(_HERE))
 try:
     from evm_lineage import (
         Bcp,
+        Branch,
         Epsl,
         LineageStore,
         BlobPipeline,
@@ -156,6 +157,55 @@ def _make_bcp(epoch_size: int, beta: int, rng_seed: int) -> Bcp:
     return Bcp(Epsl(LineageStore()), BlobPipeline(), epoch_size=epoch_size)
 
 
+def _drive(bcp: Bcp, wl: AeTpcc, n_events: int, beta: int,
+           agent_every: int = 10) -> Tuple[List[float], List[bytes], List[Dict]]:
+    """Run the full five-phase workload: TPC-C transactions via the direct
+    write path, plus one speculative agent decision step (beta branches,
+    one winner, losers pruned) every `agent_every` transactions. Returns
+    (write latencies ms, committed target hashes, raw event records)."""
+    write_lat:  List[float] = []
+    hashes_out: List[bytes] = []
+    raw:        List[Dict]  = []
+    step_i = 0
+    for i in range(n_events):
+        ev = wl.next_event(bcp.current_epoch, 0)
+        t0 = time.perf_counter()
+        bcp.write_direct(ev.sources, ev.targets, 0)
+        lat = (time.perf_counter() - t0) * 1000
+        write_lat.append(lat)
+        hashes_out.extend(ev.targets)
+        raw.append({
+            "epoch": ev.epoch, "tx_type": ev.tx_type, "branch_id": 0,
+            "sources": [s.hex() for s in ev.sources],
+            "targets": [t.hex() for t in ev.targets],
+            "latency_ms": round(lat, 4), "speculative": False,
+        })
+        if (i + 1) % agent_every == 0:
+            branches = []
+            for j in range(beta):
+                bid = 1 + step_i * beta + j
+                aev = wl.agent_step(bcp.current_epoch, bid)
+                t0 = time.perf_counter()
+                bh = bcp.phase1_write(aev.sources, aev.targets, bid)
+                write_lat.append((time.perf_counter() - t0) * 1000)
+                branches.append(Branch(id=bid, epoch=bcp.current_epoch,
+                                       event_hashes=bh))
+                raw.append({
+                    "epoch": aev.epoch, "tx_type": "AgentStep", "branch_id": bid,
+                    "sources": [s.hex() for s in aev.sources],
+                    "targets": [t.hex() for t in aev.targets],
+                    "latency_ms": round(write_lat[-1], 4), "speculative": True,
+                })
+            wid = Bcp.phase2_score(branches, scorer=lambda b: wl._rng.random())
+            winner = next(b for b in branches if b.id == wid)
+            bcp.phase3_accumulate(winner)
+            bcp.phase5_prune(branches, wid)
+            hashes_out.extend(winner.event_hashes)
+            step_i += 1
+    bcp.flush_epoch()   # seal the tail so queries hit a sealed, anchored root
+    return write_lat, hashes_out, raw
+
+
 def gen_latency(n_events: int, rng_seed: int) -> None:
     """Generate WriteLineage / QueryBL / QueryFI / QueryTS latency data (latency vs w)."""
     print("\n[Latency] Latency vs epoch_size w  (beta=4, benchmark workload)")
@@ -167,39 +217,32 @@ def gen_latency(n_events: int, rng_seed: int) -> None:
         bcp = _make_bcp(w, BETA_TABLE9, rng_seed)
         wl  = AeTpcc(beta=BETA_TABLE9, seed=rng_seed + w)
 
-        # ── write phase ────────────────────────────────────────────────────
-        write_lat: List[float] = []
-        all_hashes: List[bytes] = []
-        for i in range(n_events):
-            ev = wl.next_event(bcp.current_epoch, i % BETA_TABLE9)
-            t0 = time.perf_counter()
-            h  = bcp.phase1_write(ev.sources, ev.targets, ev.branch_id)
-            write_lat.append((time.perf_counter() - t0) * 1000)
-            all_hashes.extend(h)
+        write_lat, all_hashes, _ = _drive(bcp, wl, n_events, BETA_TABLE9)
 
-        # ── query phase (sample 200 random hashes) ─────────────────────────
+        # ── query phase: verified queries against the sealed epoch root ────
         sample = rng.sample(all_hashes, min(200, len(all_hashes)))
         svc    = LineageService(epsl=bcp._epsl, bcp=bcp)
+        pinned = bcp.current_epoch - 1          # last sealed epoch
         bl_lat, fi_lat, ts_lat = [], [], []
-        epoch_max = bcp.current_epoch
+        n_verified = n_anchored = 0
 
         for h in sample:
-            req = QueryRequest(vertex_hash=h, epoch_max=epoch_max, beta=BETA_TABLE9)
-            try:
-                t0 = time.perf_counter(); svc.query_bl(req)
-                bl_lat.append((time.perf_counter() - t0) * 1000)
-                t0 = time.perf_counter(); svc.query_fi(req)
-                fi_lat.append((time.perf_counter() - t0) * 1000)
-                t0 = time.perf_counter(); svc.query_ts(req)
-                ts_lat.append((time.perf_counter() - t0) * 1000)
-            except Exception:
-                pass
+            req = QueryRequest(vertex_hash=h, epoch_max=pinned, beta=BETA_TABLE9)
+            t0 = time.perf_counter(); r = svc.query_bl(req)
+            bl_lat.append((time.perf_counter() - t0) * 1000)
+            n_verified += int(r.verified)
+            n_anchored += int(r.anchored)
+            t0 = time.perf_counter(); svc.query_fi(req)
+            fi_lat.append((time.perf_counter() - t0) * 1000)
+            t0 = time.perf_counter(); svc.query_ts(req)
+            ts_lat.append((time.perf_counter() - t0) * 1000)
 
         ws  = _stats(write_lat)
         bls = _stats(bl_lat)
         fis = _stats(fi_lat)
         tss = _stats(ts_lat)
-        print(f"write p50={ws['p50']}ms  bl p50={bls['p50']}ms  fi p50={fis['p50']}ms")
+        print(f"write p50={ws['p50']}ms  bl p50={bls['p50']}ms  "
+              f"anchored={n_anchored}/{len(sample)}")
 
         rows.append({
             "epoch_size_w":       w,
@@ -208,6 +251,8 @@ def gen_latency(n_events: int, rng_seed: int) -> None:
             "query_bl_p50_ms":    bls["p50"], "query_bl_p99_ms": bls["p99"],
             "query_fi_p50_ms":    fis["p50"], "query_fi_p99_ms": fis["p99"],
             "query_ts_p50_ms":    tss["p50"], "query_ts_p99_ms": tss["p99"],
+            "queries_verified":   n_verified,
+            "queries_anchored":   n_anchored,
             "commits":            len(bcp._commits),
             "epsl_nodes":         bcp._epsl.node_count,
         })
@@ -224,8 +269,9 @@ W_TABLE12           = 512   # default epoch size
 
 
 def gen_dag_shape(n_events: int, rng_seed: int) -> None:
-    """Generate DAG depth / fan-out / dedup ratio across beta values (DAG shape)."""
-    print("\n[DAG shape] DAG shape vs beta  (w=512, benchmark workload)")
+    """DAG shape metrics vs beta (paper Table 12 analogue): vertex/edge
+    counts, depth, fan-in/out, DAG-merge deduplication, prune-log size."""
+    print("\n[DAG shape] DAG shape vs beta  (w=512, five-phase AE-TPCC)")
     rows: List[Dict[str, Any]] = []
 
     for beta in BETA_VALUES_TABLE12:
@@ -233,42 +279,21 @@ def gen_dag_shape(n_events: int, rng_seed: int) -> None:
         bcp = _make_bcp(W_TABLE12, beta, rng_seed)
         wl  = AeTpcc(beta=beta, seed=rng_seed + beta * 1000)
 
-        raw_events: List[Dict] = []
-        for i in range(n_events):
-            ev   = wl.next_event(bcp.current_epoch, i % beta)
-            t0   = time.perf_counter()
-            h    = bcp.phase1_write(ev.sources, ev.targets, ev.branch_id)
-            lat  = (time.perf_counter() - t0) * 1000
-            commit_happened = bcp._epsl._epoch_size > 0 and (
-                bcp._epsl.node_count % bcp._epsl._epoch_size == 0
-            )
-            raw_events.append({
-                "epoch":      bcp.current_epoch,
-                "tx_type":    ev.tx_type,
-                "branch_id":  ev.branch_id,
-                "sources":    [s.hex() for s in ev.sources],
-                "targets":    [t.hex() for t in ev.targets],
-                "n_inserted": len(h),
-                "latency_ms": round(lat, 4),
-                "commit":     commit_happened,
-            })
+        _, _, raw_events = _drive(bcp, wl, n_events, beta)
 
-        # write raw JSONL
         raw_path = RAW_DIR / f"aetpcc_events_beta{beta}.jsonl"
         with open(raw_path, "w") as f:
             for rec in raw_events:
                 f.write(json.dumps(rec) + "\n")
-        print(f"saved {len(raw_events)} raw events ...", end=" ", flush=True)
 
-        # compute DAG shape metrics
         epsl    = bcp._epsl
         nodes   = list(epsl._nodes.values())
         n_nodes = len(nodes)
         n_edges = sum(len(nd.backward) for nd in nodes)
 
-        # max / avg backward depth (BFS from each node — sample 500 for speed)
+        # sampled backward depth
         rng = random.Random(rng_seed)
-        sample_nodes = rng.sample(nodes, min(500, n_nodes)) if n_nodes else []
+        sample_nodes = rng.sample(nodes, min(300, n_nodes)) if n_nodes else []
         depths = []
         for nd in sample_nodes:
             visited, queue, d = set(), [nd.hash], 0
@@ -284,32 +309,34 @@ def gen_dag_shape(n_events: int, rng_seed: int) -> None:
                 d += 1 if nxt else 0
                 queue = nxt
             depths.append(d)
+        avg_depth = round(sum(depths) / len(depths), 2) if depths else 0
+        max_depth = max(depths) if depths else 0
 
-        avg_depth   = round(sum(depths) / len(depths), 2) if depths else 0
-        max_depth   = max(depths) if depths else 0
+        fan_in  = [len(nd.backward) for nd in nodes]
+        fan_out = [len(nd.forward)  for nd in nodes]
+        merged  = sum(1 for c in fan_in if c >= 2)     # DAG-merge vertices
 
-        # fan-out: average number of forward pointers
-        fwd_counts = [len(nd.forward) for nd in nodes]
-        avg_fanout = round(sum(fwd_counts) / n_nodes, 2) if n_nodes else 0
-        max_fanout = max(fwd_counts) if fwd_counts else 0
-
-        # dedup ratio from store
-        dedup = round(epsl._store.dedup_ratio, 4) if hasattr(epsl._store, "dedup_ratio") else 0
-
-        print(f"nodes={n_nodes} edges={n_edges} avg_depth={avg_depth} dedup={dedup}")
+        dedup = round(bcp.store.dedup_ratio, 4)
+        print(f"nodes={n_nodes} edges={n_edges} avg_depth={avg_depth} "
+              f"dedup={dedup} pruned={bcp.total_pruned}")
 
         rows.append({
-            "beta":         beta,
-            "n_events":     n_events,
-            "epoch_size_w": W_TABLE12,
-            "epsl_nodes":   n_nodes,
-            "epsl_edges":   n_edges,
-            "avg_bwd_depth":avg_depth,
-            "max_bwd_depth":max_depth,
-            "avg_fwd_fanout":avg_fanout,
-            "max_fwd_fanout":max_fanout,
-            "dedup_ratio":  dedup,
-            "commits":      len(bcp._commits),
+            "beta":            beta,
+            "n_events":        n_events,
+            "epoch_size_w":    W_TABLE12,
+            "epsl_nodes":      n_nodes,
+            "epsl_edges":      n_edges,
+            "avg_bwd_depth":   avg_depth,
+            "max_bwd_depth":   max_depth,
+            "avg_fan_in":      round(sum(fan_in) / n_nodes, 2) if n_nodes else 0,
+            "avg_fan_out":     round(sum(fan_out) / n_nodes, 2) if n_nodes else 0,
+            "max_fan_out":     max(fan_out) if fan_out else 0,
+            "merge_vertices":  merged,
+            "merge_ratio":     round(merged / n_nodes, 4) if n_nodes else 0,
+            "dedup_ratio":     dedup,
+            "pruned_branches": bcp.total_pruned,
+            "prune_log_roots": len(bcp.prune_log.anchored_roots),
+            "commits":         bcp.committed_epochs,
         })
 
     _write_csv(DATASETS / "dag_shape.csv", rows)
@@ -385,58 +412,88 @@ BETA_FIG7           = 4
 
 
 def gen_throughput(n_events: int, rng_seed: int) -> None:
-    """Simulate throughput vs. background drain interval (throughput results)."""
-    print("\n[Throughput] Throughput vs drain interval  (w=512, beta=4)")
+    """Sustained WriteLineage throughput through the service (w=512)."""
+    print("\n[Throughput] WriteLineage throughput  (w=512, beta=4)")
     rows: List[Dict[str, Any]] = []
 
-    for drain_ms in DRAIN_INTERVALS_MS:
-        print(f"  drain_interval={drain_ms}ms ...", end=" ", flush=True)
-        bcp  = _make_bcp(W_FIG7, BETA_FIG7, rng_seed)
-        svc  = LineageService(epsl=bcp._epsl, bcp=bcp)
-        wl   = AeTpcc(beta=BETA_FIG7, seed=rng_seed + drain_ms)
+    for label, batchable in [("direct", False)]:
+        bcp = _make_bcp(W_FIG7, BETA_FIG7, rng_seed)
+        svc = LineageService(epsl=bcp._epsl, bcp=bcp)
+        wl  = AeTpcc(beta=BETA_FIG7, seed=rng_seed)
 
-        wall_start    = time.perf_counter()
-        events_done   = 0
-        last_drain    = wall_start
-        total_drained = 0
+        wall_start = time.perf_counter()
         latencies: List[float] = []
-
         for i in range(n_events):
-            ev = wl.next_event(bcp.current_epoch, i % BETA_FIG7)
-            req = WriteRequest(
-                sources=ev.sources, targets=ev.targets,
-                branch_id=ev.branch_id, epoch=bcp.current_epoch,
-            )
+            ev  = wl.next_event(bcp.current_epoch, 0)
+            req = WriteRequest(sources=ev.sources, targets=ev.targets,
+                               branch_id=0, epoch=bcp.current_epoch)
             t0 = time.perf_counter()
             svc.write_lineage(req)
             latencies.append((time.perf_counter() - t0) * 1000)
-            events_done += 1
-
-            # simulate background drain on wall-clock schedule
-            now = time.perf_counter()
-            if (now - last_drain) * 1000 >= drain_ms:
-                drained = svc.drain_buffer()
-                total_drained += drained
-                last_drain = now
-
         wall_elapsed = time.perf_counter() - wall_start
-        throughput   = round(events_done / wall_elapsed, 1)
+        throughput   = round(n_events / wall_elapsed, 1)
         ws           = _stats(latencies)
 
-        print(f"throughput={throughput:.0f} ev/s  write p50={ws['p50']}ms")
+        print(f"  mode={label}: {throughput:.0f} ev/s  write p50={ws['p50']}ms")
         rows.append({
-            "drain_interval_ms": drain_ms,
-            "n_events":          events_done,
-            "wall_time_s":       round(wall_elapsed, 3),
-            "throughput_evs":    throughput,
-            "write_p50_ms":      ws["p50"],
-            "write_p99_ms":      ws["p99"],
-            "total_drained":     total_drained,
-            "epsl_nodes":        bcp._epsl.node_count,
+            "mode":            label,
+            "n_events":        n_events,
+            "wall_time_s":     round(wall_elapsed, 3),
+            "throughput_evs":  throughput,
+            "write_p50_ms":    ws["p50"],
+            "write_p99_ms":    ws["p99"],
+            "commits":         bcp.committed_epochs,
+            "epsl_nodes":      bcp._epsl.node_count,
         })
 
     _write_csv(DATASETS / "throughput.csv", rows)
     _write_json(DATASETS / "throughput.json", rows)
+
+
+def gen_proof_size(rng_seed: int) -> None:
+    """Proof size and generate/verify cost vs index size n (paper Fig. 6):
+    chains committed at n in {1k, 4k, 16k} vertices, BL result sizes
+    |BL| in {10, 50, 100}."""
+    print("\n[Proof size] Proof bytes / verify time vs n")
+    rows: List[Dict[str, Any]] = []
+    for n_target in [1_000, 4_000, 16_000]:
+        bcp = _make_bcp(1 << 30, 4, rng_seed)      # single epoch, manual seal
+        epsl = bcp._epsl
+        rng  = random.Random(rng_seed + n_target)
+        # build |BL|-deep chains embedded in filler vertices
+        chain_heads: Dict[int, bytes] = {}
+        for depth in (10, 50, 100):
+            prev = None
+            for k in range(depth):
+                h = bytes(rng.getrandbits(8) for _ in range(32))
+                epsl.insert([prev] if prev else [], [h], 0, 0)
+                prev = h
+            chain_heads[depth] = prev
+        while epsl.node_count < n_target:
+            h = bytes(rng.getrandbits(8) for _ in range(32))
+            epsl.insert([], [h], 0, 0)
+        root = epsl.commit_epoch(0).merkle_root
+        for depth, head in chain_heads.items():
+            t0 = time.perf_counter()
+            res = epsl.query_bl(head, epoch_max=0)
+            gen_ms = (time.perf_counter() - t0) * 1000
+            t0 = time.perf_counter()
+            ok = res.proof.verify(root)
+            ver_ms = (time.perf_counter() - t0) * 1000
+            assert ok
+            rows.append({
+                "n_vertices":      epsl.node_count,
+                "bl_result_size":  depth,
+                "proof_records":   len(res.proof.records),
+                "proof_depth":     res.proof.depth,
+                "proof_bytes":     res.proof.byte_size,
+                "gen_ms":          round(gen_ms, 3),
+                "verify_ms":       round(ver_ms, 3),
+            })
+            print(f"  n={epsl.node_count:6d} |BL|={depth:3d} "
+                  f"bytes={res.proof.byte_size:7d} verify={ver_ms:.2f}ms")
+    _write_csv(DATASETS / "proof_size.csv", rows)
+    _write_json(DATASETS / "proof_size.json", rows)
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +532,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Generate cost model results only.")
     p.add_argument("--throughput", action="store_true",
                    help="Generate throughput results only.")
+    p.add_argument("--proof-size", action="store_true", dest="proof_size",
+                   help="Generate proof size/verify-time results only.")
     p.add_argument("--events", type=int, default=2000,
                    help="Number of events per workload run (default: 2000).")
     p.add_argument("--seed",   type=int, default=42,
@@ -491,7 +550,8 @@ def main() -> None:
     generated: List[str] = []
 
     run_all = not any([args.latency, getattr(args, "dag_shape", False),
-                   getattr(args, "cost_model", False), args.throughput])
+                   getattr(args, "cost_model", False), args.throughput,
+                   getattr(args, "proof_size", False)])
 
     print(f"EVM-Lineage dataset generator  (events={n_events}, seed={seed})")
     print(f"Output directory: {DATASETS}\n")
@@ -515,6 +575,10 @@ def main() -> None:
     if run_all or args.throughput:
         gen_throughput(min(n_events, N_EVENTS_FIG7), seed)
         generated += ["throughput.csv", "throughput.json"]
+
+    if run_all or getattr(args, "proof_size", False):
+        gen_proof_size(seed)
+        generated += ["proof_size.csv", "proof_size.json"]
 
     _write_summary(generated)
     print(f"\n✓  Done — {len(generated)} files in {DATASETS}/")
