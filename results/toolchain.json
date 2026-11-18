@@ -1,0 +1,9 @@
+{
+  "python": "Python 3.13.18",
+  "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+  "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)",
+  "forge": "forge Version: 1.7.1",
+  "anvil": "anvil Version: 1.7.1",
+  "cast": "cast Version: 1.7.1",
+  "solc": "0.8.24"
+}

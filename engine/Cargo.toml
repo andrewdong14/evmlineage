@@ -1,29 +1,31 @@
 [package]
 name    = "evm-lineage-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Off-chain lineage engine for EVM-Lineage"
-
-[[bin]]
-name = "lineage-engine"
-path = "src/main.rs"
+license = "MIT"
 
 [lib]
 name = "lineage_engine"
 path = "src/lib.rs"
 
+[[bin]]
+name = "lineage-engine"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 sha2        = "0.10"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
-hex        = "0.4"
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
-rayon      = "1"
-thiserror  = "1"
-zstd       = "0.13"
-
-[dev-dependencies]
-# no extra deps needed for tests
+hex         = "0.4"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+rayon       = "1"
+flate2      = "1"
 
 [profile.release]
 opt-level = 3
+debug = false

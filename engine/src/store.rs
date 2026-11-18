@@ -1,12 +1,9 @@
-// src/store.rs — In-memory lineage DAG store
+// src/store.rs — in-memory store for speculative (Phase 1) writes
 //
-// In production this wraps RocksDB with three column families:
-//   "vertices"   — universal compaction, 256 MB write buffer
-//   "edges"      — level compaction, 64 MB write buffer
-//   "epsl_nodes" — FIFO compaction, 30-day TTL
-//
-// For portability / reproducibility this implementation uses std HashMap.
-// The interface is identical to the RocksDB-backed version.
+// Three maps: vertices by content hash (with the bitmask of branches that
+// reference them), edges keyed by (source hash, epoch), and an opaque
+// key-value area. A durable deployment would keep the same maps in an
+// LSM-tree store; this repository does not include one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -68,32 +65,19 @@ impl Vertex {
     }
 }
 
-// ── Edge key: (src_hash, epoch) ───────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EdgeKey { pub src: VertexHash, pub epoch: Epoch }
-
-impl EdgeKey {
-    pub fn encode(&self) -> [u8; 40] {
-        let mut k = [0u8; 40];
-        k[..32].copy_from_slice(&self.src);
-        k[32..].copy_from_slice(&self.epoch.to_be_bytes());
-        k
-    }
-}
-
 // ── LineageStore ──────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct StoreInner {
-    vertices:  HashMap<VertexHash, Vertex>,
-    edges:     HashMap<EdgeKey, Vec<VertexHash>>,
-    epsl_raw:  HashMap<Vec<u8>, Vec<u8>>,
-    inserts:   u64,
+    vertices:   HashMap<VertexHash, Vertex>,
+    /// Outgoing edges per source: (epoch, targets) lists.
+    edges:      HashMap<VertexHash, Vec<(Epoch, Vec<VertexHash>)>>,
+    raw:        HashMap<Vec<u8>, Vec<u8>>,
+    inserts:    u64,
     dag_merges: u64,
 }
 
-/// Thread-safe in-memory lineage DAG store.
+/// Thread-safe in-memory store for speculative (Phase 1) writes.
 pub struct LineageStore {
     inner: Mutex<StoreInner>,
 }
@@ -103,9 +87,9 @@ impl LineageStore {
         LineageStore { inner: Mutex::new(StoreInner::default()) }
     }
 
-    /// Insert a vertex. If hash already exists → merge branch_mask (DAG merge).
+    /// Insert a vertex, or merge the branch mask if it exists.
     /// Returns (is_new, hash).
-    pub fn put_vertex(&self, mut vtx: Vertex) -> (bool, VertexHash) {
+    pub fn put_vertex(&self, vtx: Vertex) -> (bool, VertexHash) {
         let hash = vtx.hash;
         let mut g = self.inner.lock().unwrap();
         g.inserts += 1;
@@ -122,49 +106,66 @@ impl LineageStore {
         self.inner.lock().unwrap().vertices.get(hash).cloned()
     }
 
-    /// Insert or extend an edge (src, epoch) → targets.
-    pub fn put_edge(&self, src: VertexHash, epoch: Epoch,
-                    targets: &[VertexHash]) {
-        let key = EdgeKey { src, epoch };
+    /// Add edges src -> targets, recorded under `epoch`.
+    pub fn put_edge(&self, src: VertexHash, epoch: Epoch, targets: &[VertexHash]) {
         let mut g = self.inner.lock().unwrap();
-        let entry = g.edges.entry(key).or_default();
+        let lists = g.edges.entry(src).or_default();
+        let idx = match lists.iter().position(|(ep, _)| *ep == epoch) {
+            Some(i) => i,
+            None => { lists.push((epoch, Vec::new())); lists.len() - 1 }
+        };
+        let list = &mut lists[idx].1;
         for t in targets {
-            if !entry.contains(t) { entry.push(*t); }
+            if !list.contains(t) { list.push(*t); }
         }
     }
 
-    /// Range scan: all targets from `src` in epochs [lo, hi].
-    pub fn scan_edges(&self, src: &VertexHash, lo: Epoch, hi: Epoch)
-        -> Vec<VertexHash>
-    {
+    /// All targets of `src` recorded in epochs [lo, hi].
+    pub fn scan_edges(&self, src: &VertexHash, lo: Epoch, hi: Epoch) -> Vec<VertexHash> {
         let g = self.inner.lock().unwrap();
-        let mut out = Vec::new();
-        for epoch in lo..=hi {
-            let key = EdgeKey { src: *src, epoch };
-            if let Some(tgts) = g.edges.get(&key) {
-                out.extend_from_slice(tgts);
+        let mut lists: Vec<&(Epoch, Vec<VertexHash>)> = match g.edges.get(src) {
+            Some(l) => l.iter().filter(|(ep, _)| lo <= *ep && *ep <= hi).collect(),
+            None => return Vec::new(),
+        };
+        lists.sort_by_key(|(ep, _)| *ep);
+        lists.into_iter().flat_map(|(_, t)| t.iter().copied()).collect()
+    }
+
+    /// Remove the edges src -> targets (Phase-5 garbage collection).
+    pub fn drop_edges(&self, src: &VertexHash, targets: &[VertexHash]) {
+        let mut g = self.inner.lock().unwrap();
+        let empty = match g.edges.get_mut(src) {
+            Some(lists) => {
+                for (_, list) in lists.iter_mut() { list.retain(|t| !targets.contains(t)); }
+                lists.retain(|(_, list)| !list.is_empty());
+                lists.is_empty()
             }
-        }
-        out
+            None => false,
+        };
+        if empty { g.edges.remove(src); }
     }
 
-    pub fn put_epsl_raw(&self, key: Vec<u8>, val: Vec<u8>) {
-        self.inner.lock().unwrap().epsl_raw.insert(key, val);
-    }
-    pub fn get_epsl_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.inner.lock().unwrap().epsl_raw.get(key).cloned()
-    }
-
-    /// Delete a vertex and its outgoing edges (Phase-5 GC of
-    /// branch-exclusive vertices; shared vertices are never removed).
+    /// Delete a vertex and its outgoing edges (Phase-5 garbage collection
+    /// of vertices that only pruned branches referenced).
     pub fn remove_vertex(&self, h: &VertexHash) -> bool {
         let mut g = self.inner.lock().unwrap();
         if g.vertices.remove(h).is_none() { return false; }
-        g.edges.retain(|k, _| &k.src != h);
+        g.edges.remove(h);
         true
     }
 
+    pub fn put_raw(&self, key: Vec<u8>, val: Vec<u8>) {
+        self.inner.lock().unwrap().raw.insert(key, val);
+    }
+    pub fn get_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().raw.get(key).cloned()
+    }
+
     pub fn vertex_count(&self)  -> usize { self.inner.lock().unwrap().vertices.len() }
+    pub fn edge_count(&self) -> usize {
+        self.inner.lock().unwrap().edges.values()
+            .map(|l| l.iter().map(|(_, t)| t.len()).sum::<usize>()).sum()
+    }
     pub fn inserts_total(&self)  -> u64  { self.inner.lock().unwrap().inserts }
     pub fn dag_merges_total(&self) -> u64 { self.inner.lock().unwrap().dag_merges }
     pub fn dedup_ratio(&self)    -> f64  {
@@ -205,15 +206,20 @@ mod tests {
     }
 
     #[test]
-    fn edge_scan() {
+    fn edge_scan_and_drop() {
         let store = LineageStore::new();
-        let src = sha256(b"src");
-        let t1  = sha256(b"t1");
-        let t2  = sha256(b"t2");
+        let (src, t1, t2, t3) = (sha256(b"src"), sha256(b"t1"), sha256(b"t2"), sha256(b"t3"));
         store.put_edge(src, 0, &[t1]);
-        store.put_edge(src, 1, &[t2]);
-        let r = store.scan_edges(&src, 0, 1);
-        assert_eq!(r.len(), 2);
+        store.put_edge(src, 1, &[t2, t3]);
+        store.put_edge(src, 1, &[t2]);                       // duplicate ignored
+        assert_eq!(store.scan_edges(&src, 0, 1), vec![t1, t2, t3]);
+        assert_eq!(store.scan_edges(&src, 1, 1), vec![t2, t3]);
+        assert_eq!(store.edge_count(), 3);
+        store.drop_edges(&src, &[t2]);
+        assert_eq!(store.scan_edges(&src, 0, 5), vec![t1, t3]);
+        store.drop_edges(&src, &[t1, t3]);
+        assert!(store.scan_edges(&src, 0, 5).is_empty());
+        assert_eq!(store.edge_count(), 0);
     }
 
     #[test]

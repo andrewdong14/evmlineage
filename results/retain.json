@@ -1,0 +1,64 @@
+{
+  "node_bytes": 144,
+  "params": {
+    "events": 100000,
+    "seed": 42,
+    "w": 512
+  },
+  "rows": [
+    {
+      "epochs": 196,
+      "events": 100000,
+      "retain": 1,
+      "rss_bytes": 423370752,
+      "seal_ms_mean": 75.055,
+      "skip_live_nodes": 1566538,
+      "vertices": 783266
+    },
+    {
+      "epochs": 196,
+      "events": 100000,
+      "retain": 2,
+      "rss_bytes": 481067008,
+      "seal_ms_mean": 81.231,
+      "skip_live_nodes": 1596582,
+      "vertices": 783266
+    },
+    {
+      "epochs": 196,
+      "events": 100000,
+      "retain": 4,
+      "rss_bytes": 481067008,
+      "seal_ms_mean": 83.867,
+      "skip_live_nodes": 1755325,
+      "vertices": 783266
+    },
+    {
+      "epochs": 196,
+      "events": 100000,
+      "retain": 8,
+      "rss_bytes": 548306944,
+      "seal_ms_mean": 69.555,
+      "skip_live_nodes": 2073447,
+      "vertices": 783266
+    },
+    {
+      "epochs": 196,
+      "events": 100000,
+      "retain": 16,
+      "rss_bytes": 594399232,
+      "seal_ms_mean": 70.306,
+      "skip_live_nodes": 2706088,
+      "vertices": 783266
+    },
+    {
+      "epochs": 196,
+      "events": 100000,
+      "retain": 32,
+      "rss_bytes": 773226496,
+      "seal_ms_mean": 75.682,
+      "skip_live_nodes": 3948381,
+      "vertices": 783266
+    }
+  ]
+}

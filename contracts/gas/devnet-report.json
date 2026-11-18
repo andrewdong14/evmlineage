@@ -1,0 +1,19 @@
+{
+  "chain": "anvil, hardfork cancun",
+  "anvil_version": "anvil Version: 1.7.1",
+  "commit_gas_no_blob": [
+    104796,
+    105077,
+    105077,
+    105089
+  ],
+  "commit_gas_with_blob": 104995,
+  "blob_gas_used": 131072,
+  "blob_gas_price_wei": 1,
+  "payload_bytes": 107761,
+  "payload_events": 256,
+  "blob_versioned_hash": "0x0180c19a8638e9eaac3b6b6b69cf0336cb58027d6f6e7a4f2eefeed00fcf934b",
+  "blob_hash_stored_matches": true,
+  "root_stored_matches": true,
+  "wrong_blob_hash_rejected": true
+}

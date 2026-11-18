@@ -1,0 +1,11 @@
+# build outputs
+engine/target/
+contracts/out/
+contracts/cache/
+contracts/lib/
+agent/datasets/
+__pycache__/
+*.pyc
+# scratch output of the benchmark binary
+results/replay/
+results/membership_fixture.json

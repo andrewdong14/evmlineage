@@ -1,29 +1,36 @@
 // src/lib.rs — EVM-Lineage off-chain engine
+//
+// Mirrors agent/evm_lineage.py byte for byte (tests/conformance.rs checks
+// this against testvectors/conformance.json). Everything is in memory.
 
+pub mod merkle;
+pub mod skiplist;
 pub mod store;
 pub mod epsl;
-pub mod bcp;
 pub mod blob;
+pub mod bcp;
 pub mod config;
+pub mod workload;
+pub mod baseline;
 
 pub use store::{LineageStore, Vertex, VertexHash, Epoch, BranchId};
-pub use epsl::{Epsl, EpslConfig, EpochRoot, MerkleTree, MerkleProof,
-               NodeRecord, QueryProof, QueryKind, verify_query};
+pub use merkle::{MerkleTree, MerkleProof};
+pub use epsl::{Epsl, EpslConfig, EpochRoot, MembershipProof, ProofEntry, QueryProof,
+               QueryKind, QueryResult, verify_query, chain_link, record_digest,
+               node_leaf, skip_level, sentinel_leaf, L_MAX};
 pub use bcp::{Bcp, BcpConfig, Branch, CommitResult, InMemoryAnchor,
               PruneLog, PruneLogEntry, PRUNE_ENTRY_BYTES};
-pub use blob::{BlobPipeline, BlobConfig, encode_blob, decode_blob, BlobPayload};
-pub use config::{EngineConfig, cost_per_event_usd, default_cost_arb, expected_commit_latency_s};
+pub use blob::{BlobPipeline, Event, encode_blob, decode_blob, encode_events,
+               decode_events, raw_event_bytes, blobs_needed, fits_one_transaction, Codec,
+               BLOB_USABLE_BYTES, BLOB_GAS_PER_BLOB, BLOB_HEADER_SIZE, MAX_BLOBS_PER_TX};
+pub use config::{commit_cost_wei, cost_per_event_usd, expected_commit_latency_s};
 
-#[derive(Debug, thiserror::Error)]
-pub enum EngineError {
-    #[error("store: {0}")]   Store(String),
-    #[error("epsl: {0}")]    Epsl(String),
-    #[error("bcp: {0}")]     Bcp(String),
-    #[error("blob: {0}")]    Blob(String),
-    #[error("other: {0}")]   Other(String),
-}
+use std::sync::atomic::{AtomicU64, Ordering};
 
-pub type Result<T> = std::result::Result<T, EngineError>;
+static KECCAK_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of keccak256 evaluations since process start (benchmark counter).
+pub fn keccak_calls() -> u64 { KECCAK_CALLS.load(Ordering::Relaxed) }
 
 /// SHA-256 — content addressing of data items.
 pub fn sha256(data: &[u8]) -> VertexHash {
@@ -31,10 +38,10 @@ pub fn sha256(data: &[u8]) -> VertexHash {
     Sha256::digest(data).into()
 }
 
-/// keccak-256 — Merkle pair hashing and leaf construction, so proofs
-/// verify inside the Solidity assembly loop of LineageAnchor.verifyProof.
+/// keccak-256 — every hash that the anchor contract may have to recompute.
 pub fn keccak256(data: &[u8]) -> VertexHash {
     use tiny_keccak::{Hasher, Keccak};
+    KECCAK_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut k = Keccak::v256();
     let mut out = [0u8; 32];
     k.update(data);
@@ -42,13 +49,13 @@ pub fn keccak256(data: &[u8]) -> VertexHash {
     out
 }
 
-/// Canonical sort-then-hash: keccak256(min||max) — identical across
-/// Python, Rust, and Solidity.
-pub fn hash_pair(a: VertexHash, b: VertexHash) -> VertexHash {
+/// Sorted-pair hash keccak256(min || max): identical in Python, Rust and
+/// the assembly loop of LineageAnchor.verifyProof.
+pub fn hash_pair(a: &VertexHash, b: &VertexHash) -> VertexHash {
     let (l, r) = if a <= b { (a, b) } else { (b, a) };
     let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(&l);
-    buf[32..].copy_from_slice(&r);
+    buf[..32].copy_from_slice(l);
+    buf[32..].copy_from_slice(r);
     keccak256(&buf)
 }
 

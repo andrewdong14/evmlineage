@@ -1,0 +1,91 @@
+{
+  "by_reference_bytes_per_event_not_implemented": 269.599,
+  "new_vertices_per_event": 7.183,
+  "params": {
+    "events": 219999,
+    "seed": 42,
+    "tx": 200000
+  },
+  "rows": [
+    {
+      "blobs_per_epoch_mean": 1.0,
+      "blobs_per_epoch_mean_zlib": 1.0,
+      "epochs": 3437,
+      "payload_bytes_per_epoch_max": 35957,
+      "payload_bytes_per_epoch_mean": 27454.179,
+      "payload_bytes_per_event": 428.972,
+      "ratio_dict": 0.963,
+      "ratio_zlib": 0.963,
+      "raw_bytes_per_event": 413.055,
+      "w": 64,
+      "zlib_bytes_per_event": 428.854
+    },
+    {
+      "blobs_per_epoch_mean": 1.0,
+      "blobs_per_epoch_mean_zlib": 1.0,
+      "epochs": 1718,
+      "payload_bytes_per_epoch_max": 67594,
+      "payload_bytes_per_epoch_mean": 54312.555,
+      "payload_bytes_per_event": 424.317,
+      "ratio_dict": 0.973,
+      "ratio_zlib": 0.975,
+      "raw_bytes_per_event": 413.043,
+      "w": 128,
+      "zlib_bytes_per_event": 423.566
+    },
+    {
+      "blobs_per_epoch_mean": 1.0,
+      "blobs_per_epoch_mean_zlib": 1.0,
+      "epochs": 859,
+      "payload_bytes_per_epoch_max": 121112,
+      "payload_bytes_per_epoch_mean": 106845.242,
+      "payload_bytes_per_event": 417.364,
+      "ratio_dict": 0.99,
+      "ratio_zlib": 0.995,
+      "raw_bytes_per_event": 413.043,
+      "w": 256,
+      "zlib_bytes_per_event": 414.998
+    },
+    {
+      "blobs_per_epoch_mean": 2.0,
+      "blobs_per_epoch_mean_zlib": 2.0,
+      "epochs": 429,
+      "payload_bytes_per_epoch_max": 235609,
+      "payload_bytes_per_epoch_mean": 209403.27,
+      "payload_bytes_per_event": 408.991,
+      "ratio_dict": 1.01,
+      "ratio_zlib": 1.015,
+      "raw_bytes_per_event": 413.038,
+      "w": 512,
+      "zlib_bytes_per_event": 407.123
+    },
+    {
+      "blobs_per_epoch_mean": 4.0,
+      "blobs_per_epoch_mean_zlib": 4.0,
+      "epochs": 214,
+      "payload_bytes_per_epoch_max": 435133,
+      "payload_bytes_per_epoch_mean": 409289.841,
+      "payload_bytes_per_event": 399.697,
+      "ratio_dict": 1.033,
+      "ratio_zlib": 1.037,
+      "raw_bytes_per_event": 413.011,
+      "w": 1024,
+      "zlib_bytes_per_event": 398.33
+    },
+    {
+      "blobs_per_epoch_mean": 6.972,
+      "blobs_per_epoch_mean_zlib": 6.963,
+      "epochs": 107,
+      "payload_bytes_per_epoch_max": 839437,
+      "payload_bytes_per_epoch_mean": 799674.393,
+      "payload_bytes_per_event": 390.466,
+      "ratio_dict": 1.058,
+      "ratio_zlib": 1.067,
+      "raw_bytes_per_event": 413.011,
+      "w": 2048,
+      "zlib_bytes_per_event": 387.064
+    }
+  ],
+  "sources_per_event": 7.221,
+  "targets_per_event": 5.562
+}

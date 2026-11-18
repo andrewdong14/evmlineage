@@ -5,80 +5,98 @@ blockchains — reference implementation accompanying the paper
 *"Efficient Tamper-Evident Data Lineage in EVM-Based Blockchains for
 Autonomous AI Agents"*.
 
-EVM-Lineage records a cryptographically verifiable audit trail of an
-agent's operations — which inputs it read, which outputs it produced, and
-which speculative branches it explored — anchored to a public blockchain
-so no party (including the operator) can alter the history after the
-fact, and so any client can verify query answers against an on-chain
-Merkle root.
+EVM-Lineage records which inputs an agent read, which outputs it produced
+and which speculative branches it explored. The records live off-chain in an
+authenticated index; one root per epoch is anchored on a public chain. A
+client can then check a lineage answer against the on-chain root: the check
+fails if a record was altered, withheld or added.
 
 ---
 
 ## Status and scope — read this first
 
-This repository is a **reference implementation**:
+This repository is a **reference implementation**. Everything is in memory
+and runs in one process.
 
-* The **Python layer** (`agent/evm_lineage.py`, stdlib-only) is the
-  complete, tested implementation of the EPSL index, authenticated
-  queries, the five-phase Branch Commit Protocol, the prune log, and an
-  in-memory anchor with the contract's exact semantics. It is the code
-  the benchmark harness (`agent/dataset_gen.py`) drives.
-* The **Rust engine** (`engine/`) mirrors the same constructions
-  byte-for-byte for throughput-oriented deployments. It uses an
-  **in-memory store**; the RocksDB/gRPC/Tokio production path described
-  in the paper's implementation section is *not* included here.
-* The **Solidity contracts** (`contracts/`) implement the on-chain
-  anchor with sequential-epoch commitment, Merkle proof verification,
-  and an equivocation-based fraud proof, plus an EIP-1967 proxy and a
-  minimal multisig. A Foundry test suite is included.
+* **Python layer** (`agent/evm_lineage.py`, stdlib only): the reference for
+  every data structure and protocol step — the EPSL index, verified queries,
+  the five-phase Branch Commit Protocol, the prune log, epoch payloads, and
+  an in-memory anchor with the contract's rules.
+* **Rust engine** (`engine/`): the same constructions, byte for byte, built
+  for speed. The paper's latency, throughput and memory figures come from
+  `engine/src/bin/bench.rs`.
+* **Solidity contracts** (`contracts/`): the on-chain anchor (epoch roots,
+  proof verification, equivocation fraud proof, prune-log roots), an
+  EIP-1967 proxy and a minimal multisig, with Foundry tests. The paper's gas
+  figures come from `contracts/test/Gas.t.sol`.
+* **Conformance vectors** (`testvectors/conformance.json`): written by the
+  Python layer, reproduced exactly by the Rust engine, and verified on the
+  contract. This is what backs the claim that a proof generated off-chain
+  verifies on-chain.
 
-**Reproducibility note.** All performance numbers reported anywhere
-(paper, talks) must be *measured by running this code* (or the exact
-production variant being described) on the stated hardware — e.g. via
-`agent/dataset_gen.py`, `cargo bench`-style harnesses, and `forge test
---gas-report`. Nothing in this repository hard-codes results.
+Not included: durable storage, replication, a network API, live blob
+submission. `PAPER_ALIGNMENT.md` lists what changed in this revision and
+where the prototype stops.
+
+**Reproducibility.** Every number in the paper's evaluation is produced by a
+command in this repository and stored under `results/`; see
+[Reproducing the measurements](#reproducing-the-measurements). Nothing here
+hard-codes a result.
 
 ---
 
-## Hashing conventions (identical across all three layers)
+## How it works
 
-| Purpose | Function |
+**Records.** Every vertex (data item, identified by the SHA-256 of its
+content) has a record `(h, epoch0, parents, children)`. Each of the two lists
+is append-only and grouped by the epoch in which it grew; a hash chain over
+the groups summarises it.
+
+**Index.** The records are the leaves of an authenticated skip list keyed by
+`h`. Levels are derived from the key, so the root depends only on the set of
+records. The list is persistent: sealing an epoch copies the paths of the
+records that changed and shares the rest with earlier versions, so a version
+stays readable for as long as it is retained.
+
+**Anchoring.** The Branch Commit Protocol writes every speculative branch to
+an off-chain store, puts only the winning branch into the index, and once per
+epoch calls `commitRoot(root, epoch, blobHash)`. The epoch's events travel as
+the payload (EIP-4844 blobs) of that transaction; anyone who holds the
+payloads can rebuild the index and recompute every root. A transaction
+carries at most six blobs (EIP-7594), which bounds the size of an epoch:
+about 1,700 events of the benchmark workload.
+
+**Queries.** A backward-lineage (BL), forward-impact (FI) or temporal-slice
+(TS) query is pinned to a sealed epoch and may be bounded to `k` hops. The
+answer carries, for every vertex whose neighbours were followed, its record
+as of that epoch and a membership path. `verify_query(proof, root)` — with
+`root` read from the contract — recomputes the traversal from those records
+and accepts only if
+
+1. every record hashes into the root,
+2. every vertex the traversal reaches inside the bound has a record
+   (nothing was withheld), and
+3. every supplied record is reached (nothing was added).
+
+**Fraud proof.** If a committer anchors a root that holds two different
+records for the same vertex, anyone can submit both to `slash()`: half of the
+committer's stake goes to the challenger, the rest is burned, and the epoch
+is marked disputed.
+
+### Hashing conventions (identical in all three layers; H = keccak256)
+
+| Purpose | Definition |
 |---|---|
-| Content addressing of data items | SHA-256(item bytes) |
-| Merkle pair hashing | keccak256(min(a,b) ‖ max(a,b)) |
-| Node record digest (as of epoch e) | keccak256(h ‖ lvl ‖ epoch_be ‖ n_fwd ‖ fwd≤e sorted ‖ n_bwd ‖ bwd≤e sorted) |
-| Merkle leaf | keccak256(vertexHash ‖ recordDigest) |
-| Prune-log leaf | keccak256(96-byte entry) |
+| Content addressing | `h = SHA-256(item bytes)` |
+| Pair hash | `pair(a, b) = H(min(a, b) ‖ max(a, b))` |
+| Adjacency chain link | `D' = H(D ‖ be64(epoch) ‖ be32(k) ‖ h_1 … h_k)`, `h_i` ascending, `D_0 = 0` |
+| Record digest | `d = H(h ‖ be64(epoch0) ‖ D_parents ‖ D_children)` |
+| Skip-list leaf | `leaf = H(H(h ‖ d))` |
+| Skip-list level | trailing zero bits of `h`, capped at 31 |
+| Prune-log leaf | `H(96-byte entry)` |
 
-Pair hashing and leaf construction use keccak256 specifically so that a
-proof generated by the Python or Rust layer verifies unchanged inside
-`LineageAnchor.verifyProof`, and so `LineageAnchor.slash` can recompute
-leaves from `(vertexHash, digest)` pairs on-chain. Python ships a
-pure-stdlib keccak-256 (validated against the reference vectors) and
-automatically uses `pycryptodome` or `pysha3` when installed (~50×
-faster — recommended before running benchmarks).
-
----
-
-## How verification works
-
-1. Every edge in the lineage DAG is tagged with its insertion epoch.
-   The *node record as of epoch e* restricts adjacency to edges ≤ e.
-2. Sealing an epoch Merkle-commits the leaf of every live node (sorted
-   by vertex hash); the Branch Commit Protocol anchors that state root
-   on-chain: `commitRoot(root, epoch, blobHash)`.
-3. A BL / FI / TS query returns the result set plus, per node, its
-   record and an inclusion path against the pinned epoch's root.
-4. `verify_query(proof, root)` — with `root` fetched independently from
-   the contract — checks: (a) every record hashes into the root,
-   (b) the result is **closed** under the traversal direction, so an
-   ancestor/descendant cannot be silently suppressed, and (c) the
-   traversal starts at the queried vertex.
-5. Temporal slices `TS(v, e)` are proven against the root committed
-   *at epoch e*, so historical answers stay verifiable forever.
-6. If a committer ever anchors a root binding one vertex hash to two
-   different records, anyone can submit both `(digest, proof)` pairs to
-   `slash()` and take the committer's stake.
+The leaf is double-hashed so that an interior node (hash of 64 bytes) can
+never be presented as a leaf (hash of 32 bytes); `slash()` relies on this.
 
 ---
 
@@ -86,79 +104,91 @@ faster — recommended before running benchmarks).
 
 ```
 evmlineage/
+├── agent/
+│   ├── evm_lineage.py           — reference implementation and its tests
+│   └── dataset_gen.py           — Python-side measurement harness
+├── engine/                      — Rust engine
+│   ├── src/skiplist.rs          — persistent authenticated skip list
+│   ├── src/epsl.rs              — records, sealing, queries, proofs, verify_query
+│   ├── src/bcp.rs               — five phases, InMemoryAnchor, PruneLog
+│   ├── src/blob.rs              — epoch payload encoding
+│   ├── src/store.rs             — store for speculative writes
+│   ├── src/merkle.rs            — fixed-shape Merkle tree (prune log, baseline)
+│   ├── src/workload.rs          — AE-TPCC workload generator
+│   ├── src/baseline.rs          — flat-rebuild and replay baselines
+│   ├── src/config.rs            — cost model
+│   ├── src/bin/bench.rs         — measurement harness
+│   ├── src/main.rs              — demo
+│   └── tests/conformance.rs     — checks the engine against the vectors
 ├── contracts/
-│   ├── src/LineageAnchor.sol   — epoch root anchoring, verifyProof, slash
-│   ├── src/LineageProxy.sol    — EIP-1967 proxy + minimal multisig
-│   └── test/LineageAnchor.t.sol — Foundry tests (forge test)
-│
-├── engine/src/                  — Rust mirror of the Python layer
-│   ├── store.rs                — in-memory DAG store (+ Phase-5 GC)
-│   ├── epsl.rs                 — authenticated EPSL, QueryProof, verify_query
-│   ├── bcp.rs                  — five phases, InMemoryAnchor, PruneLog
-│   ├── blob.rs                 — EIP-4844 blob encode/decode
-│   ├── config.rs               — configuration + analytical cost model
-│   └── main.rs                 — demo binary + integration tests
-│
-└── agent/
-    ├── evm_lineage.py          — reference implementation (stdlib-only)
-    └── dataset_gen.py          — five-phase AE-TPCC benchmark harness
+│   ├── src/LineageAnchor.sol    — anchor, verifyProof, slash, prune roots
+│   ├── src/LineageProxy.sol     — EIP-1967 proxy and minimal multisig
+│   ├── src/baselines/           — on-chain baselines for the gas comparison
+│   ├── test/                    — unit, conformance and gas tests
+│   └── gas/                     — gas reports written by the tests
+├── testvectors/conformance.json — cross-layer test vectors
+├── results/                     — measurements behind the paper's numbers
+└── scripts/                     — reproduction and reporting scripts
 ```
 
 ---
 
 ## Quick start
 
-### Python (no dependencies; pycryptodome optional but recommended)
+### Python (no dependencies; pycryptodome makes keccak about 50x faster)
 
 ```bash
 cd agent
-python3 evm_lineage.py        # self-tests
+python3 evm_lineage.py            # tests; ends with "56 passed, 0 failed"
 ```
 
-Expected output ends with `56 passed, 0 failed`.
-
-### Rust engine
+### Rust engine (Rust 1.75 or later)
 
 ```bash
 cd engine
-cargo test                    # unit + integration tests
-cargo run                     # demo: five-phase BCP steps
+cargo test --release              # unit tests and conformance vectors
+cargo run --release --bin lineage-engine      # demo
 ```
 
-Requires Rust 1.75+.
-
-### Solidity contracts
+### Solidity contracts (Foundry; solc 0.8.24, EVM version cancun)
 
 ```bash
 cd contracts
-forge build && forge test -vv
+forge install foundry-rs/forge-std@v1.16.1 --no-git    # once
+forge test -vv
 ```
+
+The tests were run with forge 1.7.1 and forge-std v1.16.1.
 
 ---
 
 ## Agent integration
 
 ```python
-from evm_lineage import (Bcp, Epsl, LineageStore, BlobPipeline,
-                         LineageService, WriteRequest, QueryRequest, sha256)
+from evm_lineage import (Bcp, Epsl, BlobPipeline, LineageService,
+                         WriteRequest, QueryRequest, sha256)
 
-epsl = Epsl(LineageStore())
+epsl = Epsl()
 bcp  = Bcp(epsl, BlobPipeline(), epoch_size=512)
 svc  = LineageService(epsl, bcp)
 
 # Record: sources -> targets (32-byte content hashes)
 svc.write_lineage(WriteRequest(
     sources=[sha256(b"oracle:ETH/USD:2000")],
-    targets=[sha256(b"decision:buy:0.5")],
-    branch_id=0, epoch=bcp.current_epoch))
+    targets=[sha256(b"decision:buy:0.5")]))
+
+bcp.flush_epoch()                 # seal and anchor the open epoch
 
 # Verified backward lineage, pinned to the last sealed epoch
-resp = svc.query_bl(QueryRequest(sha256(b"decision:buy:0.5"),
-                                 epoch_max=bcp.current_epoch - 1))
-assert resp.verified          # proof is cryptographically valid
-assert resp.anchored          # ...against the root on the anchor contract
-assert svc.verify(resp)       # independent re-check against the anchor
+resp = svc.query_bl(QueryRequest(sha256(b"decision:buy:0.5")))
+assert resp.anchored              # the proof verifies against the anchored root
+assert svc.verify(resp)           # independent re-check against the anchor
 ```
+
+Queries see sealed epochs only. `Epsl.query(..., pending=True)` also follows
+the edges of the open epoch; such an answer is fresh but carries no proof.
+`QueryRequest(h, epoch=e)` pins a query to an earlier epoch, and
+`max_depth=k` bounds it to `k` hops.
 
 Speculative branches (`beta` candidate continuations per decision step):
 
@@ -175,90 +205,94 @@ with mgr.new_step() as step:
     step.commit_winner()      # Phase 3 for the winner, Phase 5 for the rest
 ```
 
-Phase semantics: `phase1_write` stages events in the off-chain store
-only. The EPSL and the chain see nothing until a branch wins; losers
-leave a 96-byte, Merkle-anchored `PruneLog` entry
-(`bcp.prune_log.membership_proof(branch_hash)`) and their exclusive
-vertices are garbage-collected.
+`phase1_write` stages events in the off-chain store only. The index and the
+chain see nothing until a branch wins. Each loser leaves a 96-byte entry in
+the prune log; the Merkle root of every batch of entries is anchored, and
+`bcp.prune_log.membership(branch_hash)` returns the proof that a discarded
+branch was considered.
 
-`LineageHook` (`on_tool_call` / `on_tool_result` / `wrap_node`) adapts
-this to LangGraph-style callback interfaces.
-
----
-
-## Generating benchmark data
-
-```bash
-cd agent
-pip install pycryptodome          # optional, strongly recommended for speed
-python3 dataset_gen.py            # all benchmarks
-python3 dataset_gen.py --events 500 --latency     # quick smoke run
-```
-
-Generators (all deterministic under `--seed`):
-
-```
---latency      write + verified BL/FI/TS query latency vs epoch size w
---dag-shape    |V|, |E|, depth, fan-in/out, DAG-merge dedup, prune log vs beta
---cost-model   analytical cost sweep across chains and epoch sizes
---throughput   sustained WriteLineage throughput through the service
---proof-size   proof bytes and generate/verify time vs index size n
-```
-
-Outputs land in `agent/datasets/` as CSV + JSON with a `MANIFEST.json`,
-plus raw per-event JSONL streams under `datasets/raw/`. The latency
-generator reports how many sampled query proofs verified (`verified`)
-and matched the anchored root (`anchored`); both should equal the
-sample size.
-
-The cost generator evaluates the *analytical* model
-`C = (G_SSTORE/w)·gas + (s_e/z)·blob` — populate real gas prices,
-blob prices, and measured event sizes before quoting numbers.
+`LineageHook` (`on_tool_call` / `on_tool_result` / `wrap_node`) adapts this
+to LangGraph-style callbacks.
 
 ---
 
 ## Contracts
 
-### LineageAnchor.sol
-
 ```solidity
 function commitRoot(bytes32 root, uint64 epoch, bytes32 blobHash) external;
 function verifyProof(bytes32 leaf, bytes32[] calldata proof, uint64 epoch)
-    external view returns (bool);
+    public view returns (bool);
 function slash(bytes32 vertexHash,
                bytes32 digestA, bytes32[] calldata proofA,
                bytes32 digestB, bytes32[] calldata proofB,
                uint64  epoch) external;
-function epochRoot(uint64 e) external view returns (bytes32);
-function epochCommitter(uint64 e) external view returns (address);
+function commitPruneRoot(uint64 index, bytes32 root) external;
+function verifyPruneProof(bytes32 leaf, bytes32[] calldata proof, uint64 index)
+    external view returns (bool);
+function registerCommitter() external payable;
+function registerCommitterFor(address committer) external payable;
+function requestWithdrawal() external;
+function withdrawStake() external;
 ```
 
-* `commitRoot` enforces sequential epochs (Invariant I2) and records the
-  committer per epoch; committers stake ≥ `minStake`.
-* `verifyProof` runs the keccak sorted-pair loop in assembly; measure
-  per-hash gas with `forge test --gas-report` rather than quoting a
-  fixed figure.
-* `slash` implements the **equivocation** fraud proof: two different
-  record digests for the *same* vertex hash, both included under the
-  same epoch root. Two arbitrary distinct leaves are *not* slashable —
-  leaves are recomputed on-chain from `(vertexHash, digest)`.
+* `commitRoot` enforces sequential epochs and stores three words per epoch:
+  the root, the payload commitment, and the committer with the block
+  number. If the transaction carries blobs, `blobHash` must equal the
+  versioned hash of the blob (or keccak256 of the concatenated hashes when
+  there are several); `setRequireBlobs(true)` makes blobs mandatory.
+* `verifyProof` folds the sibling path with the sorted-pair hash.
+* `slash` takes two record digests of the same vertex with their paths and
+  recomputes both leaves on-chain.
+* A committer who wants its stake back must call `requestWithdrawal`, can no
+  longer commit, and stays slashable for `withdrawDelay` (default 7 days).
 
-### LineageProxy.sol
-
-EIP-1967 upgradeable proxy plus a minimal owner-set multisig
-(`LineageMultisig`). These are deliberately simple; production
-deployments should prefer audited implementations (e.g. OpenZeppelin,
-Safe) and, per the paper's hardening discussion, may front `commitRoot`
-with a timelock.
+`LineageProxy.sol` holds an EIP-1967 proxy and a minimal 3-of-5 multisig
+that can act as committer and proxy admin. They are deliberately simple;
+a production deployment should use audited implementations.
 
 ---
 
-## Differences from the paper
+## Reproducing the measurements
 
-See `PAPER_ALIGNMENT.md` for the full list of code ↔ paper deltas
-(storage backend, sealing cost model, the skip-list level function, and
-the precise on-chain root semantics), including items where the paper
-text should be corrected to match this implementation.
+```bash
+scripts/reproduce.sh              # tests, benchmarks, gas report, results.tex
+RUNS=3 scripts/reproduce.sh       # the same with three index runs (run-to-run spread)
+EVENTS=100000 scripts/reproduce.sh    # a smaller index run for a small machine
+```
+
+The script takes about 20 minutes (35 with `RUNS=3`) and should run on an
+otherwise idle machine, because most results are timings. Step by step it
+does the following:
+
+```bash
+# Engine: index scaling, queries, proofs, memory, flat-rebuild baseline
+cd engine
+cargo run --release --bin bench -- index   --events 1000000 --replay-max 0 --out ../results
+# Replay baseline: a shorter run of the same stream that keeps the payloads
+cargo run --release --bin bench -- index   --events 300032 --replay-max 300032 --out ../results/replay
+cargo run --release --bin bench -- retain  --out ../results
+cargo run --release --bin bench -- write   --tx 200000 --out ../results
+cargo run --release --bin bench -- payload --tx 200000 --out ../results
+cargo run --release --bin bench -- fixture --out ../contracts/test/fixtures
+
+# Contract: whole-transaction gas (each call is its own transaction)
+cd ../contracts
+forge test --isolate --match-contract GasTest -vv      # writes gas/gas-report.json
+
+# Optional: the same commits as real transactions on a local devnet,
+# including a blob-carrying one (needs anvil and cast)
+python3 ../scripts/devnet_gas.py
+
+# LaTeX macros with every number the paper uses
+python3 ../scripts/paper_numbers.py
+```
+
+`results/README.md` describes each result file and the machine the
+committed results were measured on. The index benchmark at one million
+events needs about 4 GB of memory.
+
+`agent/dataset_gen.py` runs the same experiments on the Python reference at
+a smaller scale.
 
 ---
 

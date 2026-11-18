@@ -57,7 +57,10 @@ contract LineageProxy {
     receive() external payable {}
 }
 
-/// @title LineageMultisig — 3-of-5 multisig admin for commitRoot
+/// @title LineageMultisig — minimal 3-of-5 multisig that can act as the
+///        committer (and as the proxy admin). Stake it with
+///        LineageAnchor.registerCommitterFor(address(multisig)); it can
+///        receive the stake back through withdrawStake().
 contract LineageMultisig {
     uint8 public constant THRESHOLD  = 3;
     uint8 public constant MAX_OWNERS = 5;
@@ -117,4 +120,6 @@ contract LineageMultisig {
     function isReady(bytes32 h) external view returns (bool) {
         return approvalCount[h] >= THRESHOLD && !executed[h];
     }
+
+    receive() external payable {}
 }

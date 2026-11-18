@@ -1,0 +1,11 @@
+{
+  "machine": {
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.30GHz",
+    "logical_cpus": 2,
+    "mem_total_gib": 7.836,
+    "rayon_threads": 2
+  },
+  "ns_per_pair_hash": 350.023,
+  "pair_hashes": 2000000,
+  "pair_hashes_per_s": 2856951.176
+}
